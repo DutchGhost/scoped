@@ -1,12 +1,29 @@
+//! This crate provides little utilities to declare callbacks inside a scope,
+//! that get executed on success, failure, or exit on that scope.
+//!
+//! This is different than the ScopeGuard crate does,
+//! because here it's dependent on the scope's outcome which callbacks should run.
 use std::cell::RefCell;
 
 trait Defer {
     fn call(self: Box<Self>);
 }
 
-impl<F: FnMut(T), T> Defer for (F, T) {
+impl<F: FnMut(T), T> Defer for DeferCallback<T, F> {
     fn call(mut self: Box<Self>) {
-        (self.0)(self.1);
+        (self.call_fn)(self.item);
+    }
+}
+
+#[derive(Debug)]
+struct DeferCallback<T, F> {
+    item: T,
+    call_fn: F,
+}
+
+impl<T, F> DeferCallback<T, F> {
+    fn new(item: T, call_fn: F) -> Self {
+        Self { item, call_fn }
     }
 }
 
@@ -15,7 +32,7 @@ pub struct Deferring<'a> {
     inner: RefCell<Vec<Box<dyn Defer + 'a>>>,
 }
 
-unsafe fn transmute_lifetimes_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
+unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
     std::mem::transmute(x)
 }
 
@@ -27,9 +44,15 @@ impl<'a> Deferring<'a> {
     }
 
     fn push<T: 'a>(&self, item: T, closure: impl FnMut(T) + 'a) -> &'a mut T {
-        let mut def = Box::new((closure, item));
-        let ret = unsafe { transmute_lifetimes_mut(&mut def.1) };
-        self.inner.borrow_mut().push(def);
+        let mut deferred = Box::new(DeferCallback::new(item, closure));
+
+        // This operation is safe,
+        // `deferred` is stored on the heap, moving the box does not invalidate pointers to the internals,
+        // and we never touch the box internals again without &mut self.
+        // Rust can't prove this, so in order to return a mutable reference to T,
+        // we need to `unsafely` `extend` the lifetime of the borrow.
+        let ret = unsafe { extend_lifetime_mut(&mut deferred.item) };
+        self.inner.borrow_mut().push(deferred);
         ret
     }
 
@@ -99,7 +122,7 @@ impl<T> Failure for Option<T> {
 /// A guard is used to schedule callbacks to run on a scope's success, failure, or exit, using
 /// [`Guard::on_scope_success`], [`Guard::on_scope_failure`], [`Guard::on_scope_exit`].
 ///
-/// Its important to note that callbacks schedules with [`Guard::on_scope_exit`] will *always* run, and will always run last.
+/// Its important to note that callbacks scheduled with [`Guard::on_scope_exit`] will *always* run, and will always run last.
 ///
 /// # Examples
 /// ```

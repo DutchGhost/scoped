@@ -3,5 +3,8 @@ name = "scoped"
 version = "0.1.0"
 authors = ["Dodo <kasper199914@gmail.com>"]
 edition = "2018"
+license = "MIT"
+description = "Run deferred closures at success, failure, or exit of a scope"
+repository = "https://github.com/DutchGhost/scoped.git"
 
 [dependencies]
