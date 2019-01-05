@@ -36,7 +36,7 @@ impl<T, F> DeferCallback<T, F> {
 }
 
 #[derive(Default)]
-pub struct Deferring<'a> {
+pub struct DeferStack<'a> {
     inner: RefCell<Vec<Box<dyn Defer + 'a>>>,
 }
 
@@ -44,14 +44,9 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
     std::mem::transmute(x)
 }
 
-impl<'a> Deferring<'a> {
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: RefCell::new(Vec::new()),
-        }
-    }
+impl<'a> DeferStack<'a> {
 
-    fn push<T: 'a>(&self, item: T, closure: impl FnMut(T) + 'a) -> Handle<'a, T> {
+    fn push<'s, T: 'a>(&'s self, item: T, closure: impl FnMut(T) + 'a) -> Handle<'a, T> {
         let mut deferred = Box::new(DeferCallback::new(item, closure));
 
         // This operation is safe,
@@ -124,28 +119,21 @@ impl<'a, T> DerefMut for Handle<'a, T> {
 #[derive(Default)]
 pub struct Guard<'a> {
     /// Callbacks to be run on a scope's success.
-    on_scope_success: Deferring<'a>,
+    on_scope_success: DeferStack<'a>,
 
     /// Callbacks to be run on a scope's failure.
-    on_scope_failure: Deferring<'a>,
+    on_scope_failure: DeferStack<'a>,
 
     /// Callbacks to be run on a scope's exit.
-    on_scope_exit: Deferring<'a>,
+    on_scope_exit: DeferStack<'a>,
 }
 
 impl<'a> Guard<'a> {
-    fn new() -> Self {
-        Self {
-            on_scope_success: Deferring::new(),
-            on_scope_failure: Deferring::new(),
-            on_scope_exit: Deferring::new(),
-        }
-    }
     /// Schedules defered closure `dc` to run on a scope's success.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_success<'s, T: 'a>(&'s self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_success.push(item, dc)
     }
 
@@ -153,7 +141,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_exit<'s, T: 'a>(&'s self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_exit.push(item, dc)
     }
 
@@ -161,7 +149,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_failure<'s, T: 'a>(&'s self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_failure.push(item, dc)
     }
 }
@@ -219,7 +207,7 @@ impl<T> Failure for Option<T> {
 /// }
 /// ```
 pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
-    let mut guard = Guard::new();
+    let mut guard = Guard::default();
 
     let ret = scope(&mut guard);
 
