@@ -3,7 +3,10 @@
 //!
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    ops::{Deref, DerefMut},
+};
 
 trait Defer {
     fn call(self: Box<Self>);
@@ -11,19 +14,24 @@ trait Defer {
 
 impl<F: FnMut(T), T> Defer for DeferCallback<T, F> {
     fn call(mut self: Box<Self>) {
-        (self.call_fn)(self.item);
+        if let Some(item) = self.item {
+            (self.call_fn)(item);
+        }
     }
 }
 
 #[derive(Debug)]
 struct DeferCallback<T, F> {
-    item: T,
+    item: Option<T>,
     call_fn: F,
 }
 
 impl<T, F> DeferCallback<T, F> {
     fn new(item: T, call_fn: F) -> Self {
-        Self { item, call_fn }
+        Self {
+            item: Some(item),
+            call_fn,
+        }
     }
 }
 
@@ -43,7 +51,7 @@ impl<'a> Deferring<'a> {
         }
     }
 
-    fn push<T: 'a>(&self, item: T, closure: impl FnMut(T) + 'a) -> &'a mut T {
+    fn push<T: 'a>(&self, item: T, closure: impl FnMut(T) + 'a) -> Handle<'a, T> {
         let mut deferred = Box::new(DeferCallback::new(item, closure));
 
         // This operation is safe,
@@ -53,7 +61,7 @@ impl<'a> Deferring<'a> {
         // we need to `unsafely` `extend` the lifetime of the borrow.
         let ret = unsafe { extend_lifetime_mut(&mut deferred.item) };
         self.inner.borrow_mut().push(deferred);
-        ret
+        Handle { inner: ret }
     }
 
     fn execute(mut self) {
@@ -61,6 +69,38 @@ impl<'a> Deferring<'a> {
         for d in v.into_iter().rev() {
             d.call();
         }
+    }
+}
+
+pub struct Handle<'a, T> {
+    inner: &'a mut Option<T>,
+}
+
+impl<'a, T> Handle<'a, T> {
+    #[inline]
+    /// Cancel's the handle's defered closure, returning the value the closure was going to be called with.
+    pub fn cancel(self) -> T {
+        self.inner.take().expect("Called cancel on an empty Handle")
+    }
+}
+
+impl<'a, T> Deref for Handle<'a, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_ref()
+            .expect("Called deref on an empty Handle")
+    }
+}
+
+impl<'a, T> DerefMut for Handle<'a, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_mut()
+            .expect("Called deref_mut on an empty Handle")
     }
 }
 
@@ -79,20 +119,23 @@ pub struct Guard<'a> {
 
 impl<'a> Guard<'a> {
     /// Schedules defered closure `dc` to run on a scope's success.
+    /// The defered closure can be cancelled using [`Handle::cancel`], returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> &mut T {
+    pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_success.push(item, dc)
     }
 
     /// Schedules defered closure `dc` to run on a scope's exit.
+    /// The defered closure can be cancelled using [`Handle::cancel`], returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> &mut T {
+    pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_exit.push(item, dc)
     }
 
     /// Schedules defered closure `dc` to run on a scope's failure.
+    /// The defered closure can be cancelled using [`Handle::cancel`], returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> &mut T {
+    pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_failure.push(item, dc)
     }
 }
@@ -177,7 +220,7 @@ mod tests {
     fn test_list() {
         let mut v = vec![1, 2, 3, 4, 5];
         let scope = scoped(|guard| {
-            let v = guard.on_scope_success(&mut v, |v| {
+            let mut v = guard.on_scope_success(&mut v, |v| {
                 println!("SUCCES!");
 
                 assert_eq!(*v, vec![1, 2, 3, 4, 5, 6, 7]);
@@ -185,7 +228,7 @@ mod tests {
                 v.push(10);
             });
 
-            let boxed = guard.on_scope_exit(Box::new(1), move |boxed| {
+            let mut boxed = guard.on_scope_exit(Box::new(1), move |boxed| {
                 assert_eq!(*boxed, 12);
             });
 
@@ -227,5 +270,22 @@ mod tests {
 
         assert!(number.get() == 0);
         assert_eq!(n, Some(1));
+    }
+
+    #[test]
+    fn test_cancell() {
+        let v = vec![1, 2, 3, 4, 5];
+
+        let v = scoped(|guard| -> Result<Vec<_>, ()> {
+            let mut v = guard.on_scope_exit(v, |vec| panic!(vec));
+
+            v.push(10);
+
+            let v = v.cancel();
+
+            Ok(v)
+        });
+
+        assert_eq!(v, Ok(vec![1, 2, 3, 4, 5, 10]));
     }
 }
