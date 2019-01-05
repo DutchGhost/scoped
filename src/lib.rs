@@ -45,7 +45,7 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
 }
 
 impl<'a> Deferring<'a> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: RefCell::new(Vec::new()),
         }
@@ -76,7 +76,7 @@ impl<'a> Deferring<'a> {
 }
 
 /// A handle is a handle back to the value a deferred closure is going to be called with.
-/// In order to cancel
+/// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
 pub struct Handle<'a, T> {
     inner: &'a mut Option<T>,
 }
@@ -124,6 +124,13 @@ pub struct Guard<'a> {
 }
 
 impl<'a> Guard<'a> {
+    fn new() -> Self {
+        Self {
+            on_scope_success: Deferring::new(),
+            on_scope_failure: Deferring::new(),
+            on_scope_exit: Deferring::new(),
+        }
+    }
     /// Schedules defered closure `dc` to run on a scope's success.
     /// The defered closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
@@ -214,7 +221,7 @@ impl<T> Failure for Option<T> {
 /// }
 /// ```
 pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
-    let mut guard = Guard::default();
+    let mut guard = Guard::new();
 
     let ret = scope(&mut guard);
 
