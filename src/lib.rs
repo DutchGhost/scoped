@@ -3,10 +3,7 @@
 //!
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
-use std::{
-    cell::RefCell,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
 trait Defer {
     fn call(self: Box<Self>);
@@ -37,7 +34,7 @@ impl<T, F> DeferCallback<T, F> {
 
 #[derive(Default)]
 pub struct DeferStack<'a> {
-    inner: RefCell<Vec<Box<dyn Defer + 'a>>>,
+    inner: Vec<Box<dyn Defer + 'a>>,
 }
 
 unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
@@ -45,7 +42,7 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
 }
 
 impl<'a> DeferStack<'a> {
-    fn push<T: 'a>(&self, item: T, closure: impl FnOnce(T) + 'a) -> Handle<'a, T> {
+    fn push<T: 'a>(&mut self, item: T, closure: impl FnOnce(T) + 'a) -> Handle<'a, T> {
         let mut deferred = Box::new(DeferCallback::new(item, closure));
 
         // This operation is safe,
@@ -57,12 +54,12 @@ impl<'a> DeferStack<'a> {
         // Moving the box (as we do with .push()) does not invalidate the mutable reference,
         // and we never touch the box again without &mut self
         let ret = unsafe { extend_lifetime_mut(&mut deferred.item) };
-        self.inner.borrow_mut().push(deferred);
+        self.inner.push(deferred);
         Handle { inner: ret }
     }
 
     fn execute(mut self) {
-        let v = std::mem::replace(self.inner.get_mut(), vec![]);
+        let v = std::mem::replace(&mut self.inner, vec![]);
         for d in v.into_iter().rev() {
             d.call();
         }
@@ -132,7 +129,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<T> {
+    pub fn on_scope_success<T: 'a>(&mut self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<'a, T> {
         self.on_scope_success.push(item, dc)
     }
 
@@ -140,7 +137,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<T> {
+    pub fn on_scope_exit<T: 'a>(&mut self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<'a, T> {
         self.on_scope_exit.push(item, dc)
     }
 
@@ -148,7 +145,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<T> {
+    pub fn on_scope_failure<T: 'a>(&mut self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<'a, T> {
         self.on_scope_failure.push(item, dc)
     }
 }
