@@ -27,7 +27,7 @@ struct DeferCallback<T, F> {
 }
 
 impl<T, F> DeferCallback<T, F> {
-    fn new(item: T, call_fn: F) -> Self {
+    const fn new(item: T, call_fn: F) -> Self {
         Self {
             item: Some(item),
             call_fn,
@@ -55,10 +55,13 @@ impl<'a> Deferring<'a> {
         let mut deferred = Box::new(DeferCallback::new(item, closure));
 
         // This operation is safe,
-        // `deferred` is stored on the heap, moving the box does not invalidate pointers to the internals,
-        // and we never touch the box internals again without &mut self.
-        // Rust can't prove this, so in order to return a mutable reference to T,
-        // we need to `unsafely` `extend` the lifetime of the borrow.
+        // We create a mutable reference to the item of the deferred closure,
+        // and extend its lifetime, so it can be returned.
+        //
+        // Extending the lifetime is safe here,
+        // because `deferred` is stored on the heap.
+        // Moving the box (as we do with .push()) does not invalidate the mutable reference,
+        // and we never touch the box again without &mut self
         let ret = unsafe { extend_lifetime_mut(&mut deferred.item) };
         self.inner.borrow_mut().push(deferred);
         Handle { inner: ret }
@@ -72,13 +75,16 @@ impl<'a> Deferring<'a> {
     }
 }
 
+/// A handle is a handle back to the value a deferred closure is going to be called with.
+/// In order to cancel
 pub struct Handle<'a, T> {
     inner: &'a mut Option<T>,
 }
 
 impl<'a, T> Handle<'a, T> {
+    /// Cancel's the handle's deferred closure,
+    /// returning the value the closure was going to be called with.
     #[inline]
-    /// Cancel's the handle's defered closure, returning the value the closure was going to be called with.
     pub fn cancel(self) -> T {
         self.inner.take().expect("Called cancel on an empty Handle")
     }
@@ -119,21 +125,24 @@ pub struct Guard<'a> {
 
 impl<'a> Guard<'a> {
     /// Schedules defered closure `dc` to run on a scope's success.
-    /// The defered closure can be cancelled using [`Handle::cancel`], returning the value the closure was going to be called with.
+    /// The defered closure can be cancelled using [`Handle::cancel`],
+    /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
     pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_success.push(item, dc)
     }
 
     /// Schedules defered closure `dc` to run on a scope's exit.
-    /// The defered closure can be cancelled using [`Handle::cancel`], returning the value the closure was going to be called with.
+    /// The defered closure can be cancelled using [`Handle::cancel`],
+    /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
     pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_exit.push(item, dc)
     }
 
     /// Schedules defered closure `dc` to run on a scope's failure.
-    /// The defered closure can be cancelled using [`Handle::cancel`], returning the value the closure was going to be called with.
+    /// The defered closure can be cancelled using [`Handle::cancel`],
+    /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
     pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
         self.on_scope_failure.push(item, dc)
@@ -147,14 +156,14 @@ pub trait Failure {
 }
 
 impl<T, E> Failure for Result<T, E> {
-    /// `Ok(T)` is success, `Err(E)` is failure.
+    /// [`Result::Ok`] is success, [`Result::Err`] is failure.
     fn is_error(&self) -> bool {
         self.is_err()
     }
 }
 
 impl<T> Failure for Option<T> {
-    /// `Some(T)` is success, `None` is failure.
+    /// [`Option::Some`] is success, [`Option::None`] is failure.
     fn is_error(&self) -> bool {
         self.is_none()
     }
@@ -165,7 +174,17 @@ impl<T> Failure for Option<T> {
 /// A guard is used to schedule callbacks to run on a scope's success, failure, or exit, using
 /// [`Guard::on_scope_success`], [`Guard::on_scope_failure`], [`Guard::on_scope_exit`].
 ///
-/// Its important to note that callbacks scheduled with [`Guard::on_scope_exit`] will *always* run, and will always run last.
+/// Scheduling a closure takes a closure with 1 parameter,
+/// and the parameter it is going to be called with.
+/// It returns a [`Handle`] to the parameter, so it's still usable within the scope.
+/// A [`Handle`] implements Deref and DerefMut, to access the parameter.
+///
+/// To cancel a callback, [`Handle::cancel`] should be called.
+///
+/// Its important to note that callbacks scheduled with [`Guard::on_scope_exit`] will *always* run,
+/// and will always run last.
+///
+/// The last added callback gets runned first.
 ///
 /// # Examples
 /// ```
@@ -176,8 +195,8 @@ impl<T> Failure for Option<T> {
 ///
 ///     let mut number = Cell::new(0);
 ///
-///     scoped(|guard| -> Result<(), ()> {     
-///         
+///     scoped(|guard| -> Result<(), ()> {
+///
 ///         guard.on_scope_exit(&number, move |n| {
 ///             assert_eq!(n.get(), 2);
 ///             n.set(3);
