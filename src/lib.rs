@@ -12,8 +12,8 @@ trait Defer {
     fn call(self: Box<Self>);
 }
 
-impl<F: FnMut(T), T> Defer for DeferCallback<T, F> {
-    fn call(mut self: Box<Self>) {
+impl<F: FnOnce(T), T> Defer for DeferCallback<T, F> {
+    fn call(self: Box<Self>) {
         if let Some(item) = self.item {
             (self.call_fn)(item);
         }
@@ -45,8 +45,7 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
 }
 
 impl<'a> DeferStack<'a> {
-
-    fn push<'s, T: 'a>(&'s self, item: T, closure: impl FnMut(T) + 'a) -> Handle<'a, T> {
+    fn push<T: 'a>(&self, item: T, closure: impl FnOnce(T) + 'a) -> Handle<'a, T> {
         let mut deferred = Box::new(DeferCallback::new(item, closure));
 
         // This operation is safe,
@@ -133,7 +132,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_success<'s, T: 'a>(&'s self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<T> {
         self.on_scope_success.push(item, dc)
     }
 
@@ -141,7 +140,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_exit<'s, T: 'a>(&'s self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<T> {
         self.on_scope_exit.push(item, dc)
     }
 
@@ -149,7 +148,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_failure<'s, T: 'a>(&'s self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<T> {
         self.on_scope_failure.push(item, dc)
     }
 }
