@@ -110,7 +110,17 @@ impl<'a, T> DerefMut for Handle<'a, T> {
     }
 }
 
-/// A guard is a handle to schedule callbacks on, from an outer scope.
+/// A guard is a handle to schedule closures on.
+/// Scheduling a closure takes a closure with 1 parameter,
+/// and the parameter it is going to be called with.
+/// It returns a [`Handle`] to the parameter, so it's still usable within the scope.
+/// A [`Handle`] implements Deref and DerefMut, to access the parameter.
+/// To cancel a callback, [`Handle::cancel`] should be called.
+///
+/// Its important to note that closures scheduled with [`Guard::on_scope_exit`] will *always* run,
+/// and will always run after all closures scheduled to run on success or failure are executed.
+///
+/// The last scheduled closure gets runned first.
 #[derive(Default)]
 pub struct Guard<'a> {
     /// Callbacks to be run on a scope's success.
@@ -132,7 +142,7 @@ impl<'a> Guard<'a> {
         }
     }
     /// Schedules defered closure `dc` to run on a scope's success.
-    /// The defered closure can be cancelled using [`Handle::cancel`],
+    /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
     pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
@@ -140,7 +150,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Schedules defered closure `dc` to run on a scope's exit.
-    /// The defered closure can be cancelled using [`Handle::cancel`],
+    /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
     pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
@@ -148,7 +158,7 @@ impl<'a> Guard<'a> {
     }
 
     /// Schedules defered closure `dc` to run on a scope's failure.
-    /// The defered closure can be cancelled using [`Handle::cancel`],
+    /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
     pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
@@ -180,18 +190,6 @@ impl<T> Failure for Option<T> {
 /// A scope is a closure, in which access to a guard is granted.
 /// A guard is used to schedule callbacks to run on a scope's success, failure, or exit, using
 /// [`Guard::on_scope_success`], [`Guard::on_scope_failure`], [`Guard::on_scope_exit`].
-///
-/// Scheduling a closure takes a closure with 1 parameter,
-/// and the parameter it is going to be called with.
-/// It returns a [`Handle`] to the parameter, so it's still usable within the scope.
-/// A [`Handle`] implements Deref and DerefMut, to access the parameter.
-///
-/// To cancel a callback, [`Handle::cancel`] should be called.
-///
-/// Its important to note that callbacks scheduled with [`Guard::on_scope_exit`] will *always* run,
-/// and will always run last.
-///
-/// The last added callback gets runned first.
 ///
 /// # Examples
 /// ```
