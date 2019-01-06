@@ -17,10 +17,7 @@ pub struct Callback<T, F> {
 
 impl<T, F> Callback<T, F> {
     const fn new(item: T, call_fn: F) -> Self {
-        Self {
-            item,
-            call_fn,
-        }
+        Self { item, call_fn }
     }
 }
 
@@ -71,12 +68,14 @@ pub struct DeferStack<'a> {
     inner: Vec<Box<dyn Defer + 'a>>,
 }
 
-unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
-    std::mem::transmute(x)
-}
-
 impl<'a> DeferStack<'a> {
     fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T, F> {
+        // This is used *carefully*,
+        // and only used with a mutable reference to some heap allocated memory.
+        unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
+            std::mem::transmute(x)
+        }
+
         let mut deferred = Box::new(DeferCallBack::Scheduled(Callback::new(item, closure)));
 
         // This operation is safe,
@@ -114,6 +113,7 @@ impl<'a, T, F> Handle<'a, T, F> {
     /// returning the value the closure was going to be called with.
     #[inline]
     pub fn cancel(self) -> T {
+        // drop the function, return the value
         let Callback { item, .. } = unsafe {
             Pin::get_mut_unchecked(self.inner)
                 .take()
