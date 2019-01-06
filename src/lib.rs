@@ -17,6 +17,7 @@ impl<T, F> Callback<T, F> {
     }
 }
 
+#[derive(Debug)]
 pub enum DeferCallBack<T, F> {
     Scheduled(Callback<T, F>),
     Cancelled,
@@ -57,12 +58,16 @@ impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
     }
 }
 
-#[derive(Default)]
 pub struct DeferStack<'a> {
     inner: Vec<Box<dyn Defer + 'a>>,
 }
 
 impl<'a> DeferStack<'a> {
+    #[inline]
+    fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+
     fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T, F> {
         // This is used *carefully*,
         // and only used with a mutable reference to some heap allocated memory.
@@ -147,7 +152,6 @@ impl<'a, T, F> DerefMut for Handle<'a, T, F> {
 /// and will always run after all closures scheduled to run on success or failure are executed.
 ///
 /// The last scheduled closure gets runned first.
-#[derive(Default)]
 pub struct Guard<'a> {
     /// Callbacks to be run on a scope's success.
     on_scope_success: DeferStack<'a>,
@@ -159,6 +163,12 @@ pub struct Guard<'a> {
     on_scope_exit: DeferStack<'a>,
 }
 
+// @NOTE: A GUARD SHOULD ONLY BE CREATED BY THE LIBRARY.
+// ANY WAY TO CREATE A GUARD AS A USER OF THIS LIBRARY IS UNSOUND,
+// BECAUSE YOU COULD drop(mem::replace(old_guard, new_guard)),
+// WHICH INVALIDATES ALL HANDLES RETURNED BY `old_guard`.
+//
+// THIS IS WHY THERE IS NO DEFAULT IMPLEMENTATION, OR EVEN A NEW METHOD.
 impl<'a> Guard<'a> {
     /// Schedules defered closure `dc` to run on a scope's success.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
@@ -246,7 +256,11 @@ impl<T> Failure for Option<T> {
 /// }
 /// ```
 pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
-    let mut guard = Guard::default();
+    let mut guard = Guard {
+        on_scope_success: DeferStack::new(),
+        on_scope_failure: DeferStack::new(),
+        on_scope_exit: DeferStack::new(),
+    };
 
     let ret = scope(&mut guard);
 
