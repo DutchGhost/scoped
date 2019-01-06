@@ -1,18 +1,28 @@
+#![feature(pin)]
 //! This crate provides little utilities to declare callbacks inside a scope,
 //! that get executed on success, failure, or exit on that scope.
 //!
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
-use std::ops::{Deref, DerefMut};
+use std::{
+    ops::{Deref, DerefMut},
+    pin::Pin,
+};
 
 trait Defer {
-    fn call(self: Box<Self>);
+    fn call(self: Pin<Box<Self>>);
 }
 
 impl<F: FnOnce(T), T> Defer for DeferCallback<T, F> {
-    fn call(self: Box<Self>) {
-        if let Some(item) = self.item {
-            (self.call_fn)(item);
+    fn call(self: Pin<Box<Self>>) {
+
+        // Ehh, how do you get rid of a Pin?
+        // We have a FnOnce to call here, so as_ref returning &Self,
+        // or as_mut returning &mut Self is not enough here.
+        let transposed: Box<Self> = unsafe { std::mem::transmute(self) };
+
+        if let Some(item) = transposed.item {
+            (transposed.call_fn)(item);
         }
     }
 }
@@ -34,7 +44,7 @@ impl<T, F> DeferCallback<T, F> {
 
 #[derive(Default)]
 pub struct DeferStack<'a> {
-    inner: Vec<Box<dyn Defer + 'a>>,
+    inner: Vec<Pin<Box<dyn Defer + 'a>>>,
 }
 
 unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
@@ -42,8 +52,9 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
 }
 
 impl<'a> DeferStack<'a> {
-    fn push<T: 'a>(&mut self, item: T, closure: impl FnOnce(T) + 'a) -> Handle<'a, T> {
-        let mut deferred = Box::new(DeferCallback::new(item, closure));
+
+    fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T> {
+        let mut deferred = Box::pinned(DeferCallback::new(item, closure));
 
         // This operation is safe,
         // We create a mutable reference to the item of the deferred closure,
@@ -53,9 +64,10 @@ impl<'a> DeferStack<'a> {
         // because `deferred` is stored on the heap.
         // Moving the box (as we do with .push()) does not invalidate the mutable reference,
         // and we never touch the box again without &mut self
-        let ret = unsafe { extend_lifetime_mut(&mut deferred.item) };
+        let ret: &mut Option<T> = unsafe { extend_lifetime_mut(&mut Pin::get_mut_unchecked(Pin::as_mut(&mut deferred)).item) };
+
         self.inner.push(deferred);
-        Handle { inner: ret }
+        Handle { inner: unsafe { Pin::new_unchecked(ret) } }
     }
 
     fn execute(mut self) {
@@ -69,7 +81,7 @@ impl<'a> DeferStack<'a> {
 /// A handle is a handle back to the value a deferred closure is going to be called with.
 /// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
 pub struct Handle<'a, T> {
-    inner: &'a mut Option<T>,
+    inner: Pin<&'a mut Option<T>>,
 }
 
 impl<'a, T> Handle<'a, T> {
@@ -77,7 +89,9 @@ impl<'a, T> Handle<'a, T> {
     /// returning the value the closure was going to be called with.
     #[inline]
     pub fn cancel(self) -> T {
-        self.inner.take().expect("Called cancel on an empty Handle")
+        unsafe {
+            Pin::get_mut_unchecked(self.inner).take().expect("Called cancel on an empty Handle")
+        }
     }
 }
 
@@ -86,7 +100,7 @@ impl<'a, T> Deref for Handle<'a, T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.inner
+        (*self.inner)
             .as_ref()
             .expect("Called deref on an empty Handle")
     }
@@ -95,9 +109,9 @@ impl<'a, T> Deref for Handle<'a, T> {
 impl<'a, T> DerefMut for Handle<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner
-            .as_mut()
-            .expect("Called deref_mut on an empty Handle")
+        unsafe {
+            Pin::get_mut_unchecked(Pin::as_mut(&mut self.inner)).as_mut().expect("Called deref_mut on an empty Handle")
+        }
     }
 }
 
