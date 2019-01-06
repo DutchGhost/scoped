@@ -15,7 +15,6 @@ trait Defer {
 
 impl<F: FnOnce(T), T> Defer for DeferCallback<T, F> {
     fn call(self: Pin<Box<Self>>) {
-
         // Ehh, how do you get rid of a Pin?
         // We have a FnOnce to call here, so as_ref returning &Self,
         // or as_mut returning &mut Self is not enough here.
@@ -52,7 +51,6 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
 }
 
 impl<'a> DeferStack<'a> {
-
     fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T> {
         let mut deferred = Box::pinned(DeferCallback::new(item, closure));
 
@@ -64,10 +62,14 @@ impl<'a> DeferStack<'a> {
         // because `deferred` is stored on the heap.
         // Moving the box (as we do with .push()) does not invalidate the mutable reference,
         // and we never touch the box again without &mut self
-        let ret: &mut Option<T> = unsafe { extend_lifetime_mut(&mut Pin::get_mut_unchecked(Pin::as_mut(&mut deferred)).item) };
+        let ret: &mut Option<T> = unsafe {
+            extend_lifetime_mut(&mut Pin::get_mut_unchecked(Pin::as_mut(&mut deferred)).item)
+        };
 
         self.inner.push(deferred);
-        Handle { inner: unsafe { Pin::new_unchecked(ret) } }
+        Handle {
+            inner: unsafe { Pin::new_unchecked(ret) },
+        }
     }
 
     fn execute(mut self) {
@@ -90,7 +92,9 @@ impl<'a, T> Handle<'a, T> {
     #[inline]
     pub fn cancel(self) -> T {
         unsafe {
-            Pin::get_mut_unchecked(self.inner).take().expect("Called cancel on an empty Handle")
+            Pin::get_mut_unchecked(self.inner)
+                .take()
+                .expect("Called cancel on an empty Handle")
         }
     }
 }
@@ -110,7 +114,9 @@ impl<'a, T> DerefMut for Handle<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
-            Pin::get_mut_unchecked(Pin::as_mut(&mut self.inner)).as_mut().expect("Called deref_mut on an empty Handle")
+            Pin::get_mut_unchecked(Pin::as_mut(&mut self.inner))
+                .as_mut()
+                .expect("Called deref_mut on an empty Handle")
         }
     }
 }
