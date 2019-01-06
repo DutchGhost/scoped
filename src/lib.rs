@@ -1,13 +1,9 @@
-#![feature(pin)]
 //! This crate provides little utilities to declare callbacks inside a scope,
 //! that get executed on success, failure, or exit on that scope.
 //!
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
-use std::{
-    ops::{Deref, DerefMut},
-    pin::Pin,
-};
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug)]
 pub struct Callback<T, F> {
@@ -42,9 +38,7 @@ impl<T, F> DeferCallBack<T, F> {
     }
 
     fn take(&mut self) -> Option<Callback<T, F>> {
-        let old = std::mem::replace(self, DeferCallBack::Cancelled);
-
-        match old {
+        match std::mem::replace(self, DeferCallBack::Cancelled) {
             DeferCallBack::Scheduled(callback) => Some(callback),
             _ => None,
         }
@@ -89,9 +83,7 @@ impl<'a> DeferStack<'a> {
         let ret: &mut DeferCallBack<T, F> = unsafe { extend_lifetime_mut(&mut *deferred) };
 
         self.inner.push(deferred);
-        Handle {
-            inner: unsafe { Pin::new_unchecked(ret) },
-        }
+        Handle { inner: ret }
     }
 
     fn execute(mut self) {
@@ -105,7 +97,7 @@ impl<'a> DeferStack<'a> {
 /// A handle is a handle back to the value a deferred closure is going to be called with.
 /// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
 pub struct Handle<'a, T, F> {
-    inner: Pin<&'a mut DeferCallBack<T, F>>,
+    inner: &'a mut DeferCallBack<T, F>,
 }
 
 impl<'a, T, F> Handle<'a, T, F> {
@@ -114,11 +106,7 @@ impl<'a, T, F> Handle<'a, T, F> {
     #[inline]
     pub fn cancel(self) -> T {
         // drop the function, return the value
-        let Callback { item, .. } = unsafe {
-            Pin::get_mut_unchecked(self.inner)
-                .take()
-                .expect("Called cancel on an empty Handle")
-        };
+        let Callback { item, .. } = self.inner.take().expect("Called cancel on an empty Handle");
 
         item
     }
@@ -129,7 +117,8 @@ impl<'a, T, F> Deref for Handle<'a, T, F> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &(*self.inner)
+        &self
+            .inner
             .as_ref()
             .expect("Called deref on an empty Handle")
             .item
@@ -139,12 +128,11 @@ impl<'a, T, F> Deref for Handle<'a, T, F> {
 impl<'a, T, F> DerefMut for Handle<'a, T, F> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe {
-            &mut Pin::get_mut_unchecked(Pin::as_mut(&mut self.inner))
-                .as_mut()
-                .expect("Called deref_mut on an empty Handle")
-                .item
-        }
+        &mut self
+            .inner
+            .as_mut()
+            .expect("Called deref_mut on an empty Handle")
+            .item
     }
 }
 
