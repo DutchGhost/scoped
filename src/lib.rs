@@ -3,7 +3,11 @@
 //!
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
-use std::ops::{Deref, DerefMut};
+use std::{
+    cell::RefCell,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+};
 
 #[derive(Debug)]
 pub struct Callback<T, F> {
@@ -59,16 +63,18 @@ impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
 }
 
 pub struct DeferStack<'a> {
-    inner: Vec<Box<dyn Defer + 'a>>,
+    inner: RefCell<Vec<Box<dyn Defer + 'a>>>,
 }
 
 impl<'a> DeferStack<'a> {
     #[inline]
     fn new() -> Self {
-        Self { inner: Vec::new() }
+        Self {
+            inner: RefCell::new(Vec::new()),
+        }
     }
 
-    fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T, F> {
+    fn push<'s, T: 'a, F: FnOnce(T) + 'a>(&'s self, item: T, closure: F) -> Handle<'a, 's, T, F> {
         // This is used *carefully*,
         // and only used with a mutable reference to some heap allocated memory.
         unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
@@ -87,12 +93,15 @@ impl<'a> DeferStack<'a> {
         // and we never touch the box again without &mut self
         let ret: &mut DeferCallBack<T, F> = unsafe { extend_lifetime_mut(&mut *deferred) };
 
-        self.inner.push(deferred);
-        Handle { inner: ret }
+        self.inner.borrow_mut().push(deferred);
+        Handle {
+            inner: ret,
+            lifetime: PhantomData,
+        }
     }
 
     fn execute(mut self) {
-        let v = std::mem::replace(&mut self.inner, vec![]);
+        let v = std::mem::replace(self.inner.get_mut(), vec![]);
         for d in v.into_iter().rev() {
             d.call();
         }
@@ -101,11 +110,15 @@ impl<'a> DeferStack<'a> {
 
 /// A handle is a handle back to the value a deferred closure is going to be called with.
 /// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
-pub struct Handle<'a, T, F> {
+pub struct Handle<'a, 'life, T, F> {
     inner: &'a mut DeferCallBack<T, F>,
+
+    /// Ties back to the lifetime of the DeferStack,
+    /// this prevents leaking a Handle into a vector of an outer scope.
+    lifetime: PhantomData<&'life mut T>,
 }
 
-impl<'a, T, F> Handle<'a, T, F> {
+impl<'a, 's, T, F> Handle<'a, 's, T, F> {
     /// Cancel's the handle's deferred closure,
     /// returning the value the closure was going to be called with.
     #[inline]
@@ -117,7 +130,7 @@ impl<'a, T, F> Handle<'a, T, F> {
     }
 }
 
-impl<'a, T, F> Deref for Handle<'a, T, F> {
+impl<'a, 's, T, F> Deref for Handle<'a, 's, T, F> {
     type Target = T;
 
     #[inline]
@@ -130,7 +143,7 @@ impl<'a, T, F> Deref for Handle<'a, T, F> {
     }
 }
 
-impl<'a, T, F> DerefMut for Handle<'a, T, F> {
+impl<'a, 's, T, F> DerefMut for Handle<'a, 's, T, F> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self
@@ -144,7 +157,7 @@ impl<'a, T, F> DerefMut for Handle<'a, T, F> {
 /// A guard is a handle to schedule closures on.
 /// Scheduling a closure takes a closure, and the paremeter to call it with.
 /// The returned value from scheduling is a [`Handle`].
-/// 
+///
 /// This handle implements Deref and DerefMut,
 /// through which the specified parameter is still accesable within the scope.
 ///
@@ -173,29 +186,33 @@ impl<'a> Guard<'a> {
     /// Schedules deferred closure `dc` to run on a scope's success.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    pub fn on_scope_success<T: 'a, F: FnOnce(T) + 'a>(
-        &mut self,
+    pub fn on_scope_success<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
         item: T,
         dc: F,
-    ) -> Handle<'a, T, F> {
+    ) -> Handle<'a, 's, T, F> {
         self.on_scope_success.push(item, dc)
     }
 
     /// Schedules deferred closure `dc` to run on a scope's exit.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    pub fn on_scope_exit<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, dc: F) -> Handle<'a, T, F> {
+    pub fn on_scope_exit<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
+        item: T,
+        dc: F,
+    ) -> Handle<'a, 's, T, F> {
         self.on_scope_exit.push(item, dc)
     }
 
     /// Schedules deferred closure `dc` to run on a scope's failure.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    pub fn on_scope_failure<T: 'a, F: FnOnce(T) + 'a>(
-        &mut self,
+    pub fn on_scope_failure<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
         item: T,
         dc: F,
-    ) -> Handle<'a, T, F> {
+    ) -> Handle<'a, 's, T, F> {
         self.on_scope_failure.push(item, dc)
     }
 }
@@ -252,29 +269,29 @@ impl<T> Failure for Option<T> {
 ///     assert_eq!(number.get(), 3);
 /// }
 /// ```
-/// 
+///
 /// A callback can also be cancelled, using [`Handle::cancel`]
 /// ```
 /// use scoped::{Guard, scoped};
-/// 
+///
 /// fn main() {
-/// 
+///
 ///     let mut v = vec![1, 2, 3];
-/// 
+///
 ///     scoped(|guard| -> Option<()> {
 ///         let mut handle = guard.on_scope_exit(&mut v, |vec| {
 ///             panic!()
 ///         });
-/// 
+///
 ///         handle.push(4);
 ///         
 ///         let cancelled = handle.cancel();
-/// 
+///
 ///         cancelled.push(5);
 ///         
 ///         Some(())
 ///     });
-/// 
+///
 ///     assert_eq!(v, vec![1, 2, 3, 4, 5]);
 /// }
 /// ```
@@ -296,6 +313,39 @@ pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
     guard.on_scope_exit.execute();
 
     ret
+}
+
+#[macro_export]
+macro_rules! scope_success {
+    ($guard:expr, $capture:expr, $exec:expr) => {
+        $guard.on_scope_success($capture, $exec)
+    };
+
+    ($guard:expr, $exec:expr) => {
+        $guard.on_scope_success((), |_| $exec())
+    };
+}
+
+#[macro_export]
+macro_rules! scope_failure {
+    ($guard:expr, $capture:expr, $exec:expr) => {
+        $guard.on_scope_failure($capture, $exec)
+    };
+
+    ($guard:expr, $exec:expr) => {
+        $guard.on_scope_failure((), |_| $exec())
+    };
+}
+
+#[macro_export]
+macro_rules! scope_exit {
+    ($guard:expr, $capture:expr, $exec:expr) => {
+        $guard.on_scope_exit($capture, $exec)
+    };
+
+    ($guard:expr, $exec:expr) => {
+        $guard.on_scope_exit((), |_| $exec())
+    };
 }
 
 pub type ScopeResult<E> = Result<(), E>;
@@ -376,4 +426,17 @@ mod tests {
 
         assert_eq!(v, Ok(vec![1, 2, 3, 4, 5, 10]));
     }
+
+    // #[test]
+    // fn leak_handle() {
+    //     let mut handles = vec![];
+
+    //     scoped(|guard| {
+    //         let handle = guard.on_scope_exit(vec![1, 2, 3, 4], |v| {});
+
+    //         handles.push(handle);
+
+    //         Some(())
+    //     });
+    // }
 }
