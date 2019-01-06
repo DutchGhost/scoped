@@ -9,41 +9,66 @@ use std::{
     pin::Pin,
 };
 
-trait Defer {
-    fn call(self: Pin<Box<Self>>);
+#[derive(Debug)]
+pub struct Callback<T, F> {
+    item: T,
+    call_fn: F,
 }
 
-impl<F: FnOnce(T), T> Defer for DeferCallback<T, F> {
-    fn call(self: Pin<Box<Self>>) {
-        // Ehh, how do you get rid of a Pin?
-        // We have a FnOnce to call here, so as_ref returning &Self,
-        // or as_mut returning &mut Self is not enough here.
-        let transposed: Box<Self> = unsafe { std::mem::transmute(self) };
-
-        if let Some(item) = transposed.item {
-            (transposed.call_fn)(item);
+impl<T, F> Callback<T, F> {
+    const fn new(item: T, call_fn: F) -> Self {
+        Self {
+            item,
+            call_fn,
         }
     }
 }
 
-#[derive(Debug)]
-struct DeferCallback<T, F> {
-    item: Option<T>,
-    call_fn: F,
+pub enum DeferCallBack<T, F> {
+    Scheduled(Callback<T, F>),
+    Cancelled,
 }
 
-impl<T, F> DeferCallback<T, F> {
-    const fn new(item: T, call_fn: F) -> Self {
-        Self {
-            item: Some(item),
-            call_fn,
+impl<T, F> DeferCallBack<T, F> {
+    fn as_ref(&self) -> Option<&Callback<T, F>> {
+        match self {
+            DeferCallBack::Scheduled(ref callback) => Some(callback),
+            _ => None,
+        }
+    }
+
+    fn as_mut(&mut self) -> Option<&mut Callback<T, F>> {
+        match self {
+            DeferCallBack::Scheduled(ref mut callback) => Some(callback),
+            _ => None,
+        }
+    }
+
+    fn take(&mut self) -> Option<Callback<T, F>> {
+        let old = std::mem::replace(self, DeferCallBack::Cancelled);
+
+        match old {
+            DeferCallBack::Scheduled(callback) => Some(callback),
+            _ => None,
+        }
+    }
+}
+
+trait Defer {
+    fn call(self: Box<Self>);
+}
+
+impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
+    fn call(self: Box<Self>) {
+        if let DeferCallBack::Scheduled(callback) = *self {
+            (callback.call_fn)(callback.item)
         }
     }
 }
 
 #[derive(Default)]
 pub struct DeferStack<'a> {
-    inner: Vec<Pin<Box<dyn Defer + 'a>>>,
+    inner: Vec<Box<dyn Defer + 'a>>,
 }
 
 unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
@@ -51,8 +76,8 @@ unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
 }
 
 impl<'a> DeferStack<'a> {
-    fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T> {
-        let mut deferred = Box::pinned(DeferCallback::new(item, closure));
+    fn push<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, closure: F) -> Handle<'a, T, F> {
+        let mut deferred = Box::new(DeferCallBack::Scheduled(Callback::new(item, closure)));
 
         // This operation is safe,
         // We create a mutable reference to the item of the deferred closure,
@@ -62,9 +87,7 @@ impl<'a> DeferStack<'a> {
         // because `deferred` is stored on the heap.
         // Moving the box (as we do with .push()) does not invalidate the mutable reference,
         // and we never touch the box again without &mut self
-        let ret: &mut Option<T> = unsafe {
-            extend_lifetime_mut(&mut Pin::get_mut_unchecked(Pin::as_mut(&mut deferred)).item)
-        };
+        let ret: &mut DeferCallBack<T, F> = unsafe { extend_lifetime_mut(&mut *deferred) };
 
         self.inner.push(deferred);
         Handle {
@@ -82,41 +105,45 @@ impl<'a> DeferStack<'a> {
 
 /// A handle is a handle back to the value a deferred closure is going to be called with.
 /// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
-pub struct Handle<'a, T> {
-    inner: Pin<&'a mut Option<T>>,
+pub struct Handle<'a, T, F> {
+    inner: Pin<&'a mut DeferCallBack<T, F>>,
 }
 
-impl<'a, T> Handle<'a, T> {
+impl<'a, T, F> Handle<'a, T, F> {
     /// Cancel's the handle's deferred closure,
     /// returning the value the closure was going to be called with.
     #[inline]
     pub fn cancel(self) -> T {
-        unsafe {
+        let Callback { item, .. } = unsafe {
             Pin::get_mut_unchecked(self.inner)
                 .take()
                 .expect("Called cancel on an empty Handle")
-        }
+        };
+
+        item
     }
 }
 
-impl<'a, T> Deref for Handle<'a, T> {
+impl<'a, T, F> Deref for Handle<'a, T, F> {
     type Target = T;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        (*self.inner)
+        &(*self.inner)
             .as_ref()
             .expect("Called deref on an empty Handle")
+            .item
     }
 }
 
-impl<'a, T> DerefMut for Handle<'a, T> {
+impl<'a, T, F> DerefMut for Handle<'a, T, F> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe {
-            Pin::get_mut_unchecked(Pin::as_mut(&mut self.inner))
+            &mut Pin::get_mut_unchecked(Pin::as_mut(&mut self.inner))
                 .as_mut()
                 .expect("Called deref_mut on an empty Handle")
+                .item
         }
     }
 }
@@ -149,7 +176,11 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_success<T: 'a>(&mut self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<'a, T> {
+    pub fn on_scope_success<T: 'a, F: FnOnce(T) + 'a>(
+        &mut self,
+        item: T,
+        dc: F,
+    ) -> Handle<'a, T, F> {
         self.on_scope_success.push(item, dc)
     }
 
@@ -157,7 +188,7 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_exit<T: 'a>(&mut self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<'a, T> {
+    pub fn on_scope_exit<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, dc: F) -> Handle<'a, T, F> {
         self.on_scope_exit.push(item, dc)
     }
 
@@ -165,7 +196,11 @@ impl<'a> Guard<'a> {
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
     #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_failure<T: 'a>(&mut self, item: T, dc: impl FnOnce(T) + 'a) -> Handle<'a, T> {
+    pub fn on_scope_failure<T: 'a, F: FnOnce(T) + 'a>(
+        &mut self,
+        item: T,
+        dc: F,
+    ) -> Handle<'a, T, F> {
         self.on_scope_failure.push(item, dc)
     }
 }
