@@ -142,11 +142,11 @@ impl<'a, T, F> DerefMut for Handle<'a, T, F> {
 }
 
 /// A guard is a handle to schedule closures on.
-/// Scheduling a closure takes a closure with 1 parameter,
-/// and the parameter it is going to be called with.
-/// It returns a [`Handle`] to the parameter, so it's still usable within the scope.
-/// A [`Handle`] implements Deref and DerefMut, to access the parameter.
-/// To cancel a callback, [`Handle::cancel`] should be called.
+/// Scheduling a closure takes a closure, and the paremeter to call it with.
+/// The returned value from scheduling is a [`Handle`].
+/// 
+/// This handle implements Deref and DerefMut,
+/// through which the specified parameter is still accesable within the scope.
 ///
 /// Its important to note that closures scheduled with [`Guard::on_scope_exit`] will *always* run,
 /// and will always run after all closures scheduled to run on success or failure are executed.
@@ -170,10 +170,9 @@ pub struct Guard<'a> {
 //
 // THIS IS WHY THERE IS NO DEFAULT IMPLEMENTATION, OR EVEN A NEW METHOD.
 impl<'a> Guard<'a> {
-    /// Schedules defered closure `dc` to run on a scope's success.
+    /// Schedules deferred closure `dc` to run on a scope's success.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    #[allow(clippy::mut_from_ref)]
     pub fn on_scope_success<T: 'a, F: FnOnce(T) + 'a>(
         &mut self,
         item: T,
@@ -182,18 +181,16 @@ impl<'a> Guard<'a> {
         self.on_scope_success.push(item, dc)
     }
 
-    /// Schedules defered closure `dc` to run on a scope's exit.
+    /// Schedules deferred closure `dc` to run on a scope's exit.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    #[allow(clippy::mut_from_ref)]
     pub fn on_scope_exit<T: 'a, F: FnOnce(T) + 'a>(&mut self, item: T, dc: F) -> Handle<'a, T, F> {
         self.on_scope_exit.push(item, dc)
     }
 
-    /// Schedules defered closure `dc` to run on a scope's failure.
+    /// Schedules deferred closure `dc` to run on a scope's failure.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    #[allow(clippy::mut_from_ref)]
     pub fn on_scope_failure<T: 'a, F: FnOnce(T) + 'a>(
         &mut self,
         item: T,
@@ -255,6 +252,32 @@ impl<T> Failure for Option<T> {
 ///     assert_eq!(number.get(), 3);
 /// }
 /// ```
+/// 
+/// A callback can also be cancelled, using [`Handle::cancel`]
+/// ```
+/// use scoped::{Guard, scoped};
+/// 
+/// fn main() {
+/// 
+///     let mut v = vec![1, 2, 3];
+/// 
+///     scoped(|guard| -> Option<()> {
+///         let mut handle = guard.on_scope_exit(&mut v, |vec| {
+///             panic!()
+///         });
+/// 
+///         handle.push(4);
+///         
+///         let cancelled = handle.cancel();
+/// 
+///         cancelled.push(5);
+///         
+///         Some(())
+///     });
+/// 
+///     assert_eq!(v, vec![1, 2, 3, 4, 5]);
+/// }
+/// ```
 pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
     let mut guard = Guard {
         on_scope_success: DeferStack::new(),
@@ -284,7 +307,7 @@ mod tests {
     #[test]
     fn test_list() {
         let mut v = vec![1, 2, 3, 4, 5];
-        let scope = scoped(|guard| {
+        scoped(|guard| -> Option<()> {
             let mut v = guard.on_scope_success(&mut v, |v| {
                 println!("SUCCES!");
 
@@ -302,7 +325,7 @@ mod tests {
 
             **boxed = 12;
 
-            Some(10)
+            Some(())
         });
     }
 
