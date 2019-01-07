@@ -97,9 +97,12 @@ impl<'a> DeferStack<'a> {
             let ret: &mut DeferCallBack<T, F> = &mut *raw_ptr;
             let deferred = Box::from_raw(raw_ptr);
 
-            (&mut *(self.inner.get() )).push(deferred);
+            (&mut *(self.inner.get())).push(deferred);
 
-            Handle { inner: ret, __nosend: PhantomData }
+            Handle {
+                inner: ret,
+                __nosend: PhantomData,
+            }
         }
     }
 
