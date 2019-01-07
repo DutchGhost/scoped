@@ -4,7 +4,7 @@
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
 use std::{
-    cell::RefCell,
+    cell::UnsafeCell,
     marker::PhantomData,
     ops::{Deref, DerefMut},
 };
@@ -63,45 +63,48 @@ impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
 }
 
 pub struct DeferStack<'a> {
-    inner: RefCell<Vec<Box<dyn Defer + 'a>>>,
+    inner: UnsafeCell<Vec<Box<dyn Defer + 'a>>>,
+
+    // NOT SENDABLE,
+    __nosend: PhantomData<*mut ()>,
 }
 
 impl<'a> DeferStack<'a> {
     #[inline]
     fn new() -> Self {
         Self {
-            inner: RefCell::new(Vec::new()),
+            inner: UnsafeCell::new(Vec::new()),
+            __nosend: PhantomData,
         }
     }
 
-    fn push<'s, T: 'a, F: FnOnce(T) + 'a>(&'s self, item: T, closure: F) -> Handle<'a, 's, T, F> {
-        // This is used *carefully*,
-        // and only used with a mutable reference to some heap allocated memory.
-        unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
-            std::mem::transmute(x)
-        }
+    fn push<'s, T: 'a, F: FnOnce(T) + 'a>(&'s self, item: T, closure: F) -> Handle<'s, T, F> {
+        let deferred = Box::new(DeferCallBack::Scheduled(Callback::new(item, closure)));
 
-        let mut deferred = Box::new(DeferCallBack::Scheduled(Callback::new(item, closure)));
-
-        // This operation is safe,
-        // We create a mutable reference to the item of the deferred closure,
-        // and extend its lifetime, so it can be returned.
+        // The Box is transformed into a raw pointer,
+        // then the raw pointer *itself* is copied, an transformed into a mutable reference,
+        // and then the original raw pointer is transformed back into a box,
+        // finally the mutable reference is returned in the form of a Handle.
         //
-        // Extending the lifetime is safe here,
-        // because `deferred` is stored on the heap.
-        // Moving the box (as we do with .push()) does not invalidate the mutable reference,
-        // and we never touch the box again without &mut self
-        let ret: &mut DeferCallBack<T, F> = unsafe { extend_lifetime_mut(&mut *deferred) };
+        // This is safe, because the Handle has lifetime 's, which is the lifetime of Self.
+        // Trying to hold onto a Handle when Self drops, is not possible.
+        //
+        // Also, the Handle is not invalidad whenever the Box moves (on a vectors reallocation for example),
+        // because the mutable reference the Handle contains, references heap memory.
+        unsafe {
+            let raw_ptr = Box::into_raw(deferred);
 
-        self.inner.borrow_mut().push(deferred);
-        Handle {
-            inner: ret,
-            lifetime: PhantomData,
+            let ret: &mut DeferCallBack<T, F> = &mut *raw_ptr;
+            let deferred = Box::from_raw(raw_ptr);
+
+            (&mut *(self.inner.get() )).push(deferred);
+
+            Handle { inner: ret, __nosend: PhantomData }
         }
     }
 
-    fn execute(mut self) {
-        let v = std::mem::replace(self.inner.get_mut(), vec![]);
+    fn execute(self) {
+        let v = std::mem::replace(&mut self.inner.into_inner(), vec![]);
         for d in v.into_iter().rev() {
             d.call();
         }
@@ -110,15 +113,14 @@ impl<'a> DeferStack<'a> {
 
 /// A handle is a handle back to the value a deferred closure is going to be called with.
 /// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
-pub struct Handle<'a, 'life, T, F> {
+pub struct Handle<'a, T: 'a, F> {
     inner: &'a mut DeferCallBack<T, F>,
 
-    /// Ties back to the lifetime of the DeferStack,
-    /// this prevents leaking a Handle into a vector of an outer scope.
-    lifetime: PhantomData<&'life mut T>,
+    // NOT SENDABLE,
+    __nosend: PhantomData<*mut ()>,
 }
 
-impl<'a, 's, T, F> Handle<'a, 's, T, F> {
+impl<'a, T, F> Handle<'a, T, F> {
     /// Cancel's the handle's deferred closure,
     /// returning the value the closure was going to be called with.
     #[inline]
@@ -130,7 +132,7 @@ impl<'a, 's, T, F> Handle<'a, 's, T, F> {
     }
 }
 
-impl<'a, 's, T, F> Deref for Handle<'a, 's, T, F> {
+impl<'a, T, F> Deref for Handle<'a, T, F> {
     type Target = T;
 
     #[inline]
@@ -143,7 +145,7 @@ impl<'a, 's, T, F> Deref for Handle<'a, 's, T, F> {
     }
 }
 
-impl<'a, 's, T, F> DerefMut for Handle<'a, 's, T, F> {
+impl<'a, T, F> DerefMut for Handle<'a, T, F> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self
@@ -190,7 +192,7 @@ impl<'a> Guard<'a> {
         &'s self,
         item: T,
         dc: F,
-    ) -> Handle<'a, 's, T, F> {
+    ) -> Handle<'s, T, F> {
         self.on_scope_success.push(item, dc)
     }
 
@@ -201,7 +203,7 @@ impl<'a> Guard<'a> {
         &'s self,
         item: T,
         dc: F,
-    ) -> Handle<'a, 's, T, F> {
+    ) -> Handle<'s, T, F> {
         self.on_scope_exit.push(item, dc)
     }
 
@@ -212,7 +214,7 @@ impl<'a> Guard<'a> {
         &'s self,
         item: T,
         dc: F,
-    ) -> Handle<'a, 's, T, F> {
+    ) -> Handle<'s, T, F> {
         self.on_scope_failure.push(item, dc)
     }
 }
@@ -295,14 +297,18 @@ impl<T> Failure for Option<T> {
 ///     assert_eq!(v, vec![1, 2, 3, 4, 5]);
 /// }
 /// ```
-pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
-    let mut guard = Guard {
+pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&Guard<'a>) -> R + 'a) -> R {
+    // Notice that only an &Guard<'a> is given,
+    // this way, 2 guard's can never be mem::swap`d,
+    // or mem::replace`d.
+
+    let guard = Guard {
         on_scope_success: DeferStack::new(),
         on_scope_failure: DeferStack::new(),
         on_scope_exit: DeferStack::new(),
     };
 
-    let ret = scope(&mut guard);
+    let ret = scope(&guard);
 
     if !ret.is_error() {
         guard.on_scope_success.execute();
@@ -435,6 +441,28 @@ mod tests {
     //         let handle = guard.on_scope_exit(vec![1, 2, 3, 4], |v| {});
 
     //         handles.push(handle);
+
+    //         Some(())
+    //     });
+    // }
+
+    // #[test]
+    // fn test_swap_guards() {
+    //     scoped(|good_guard| {
+    //         let mut g = good_guard.on_scope_success(vec![0], |mut v| {
+    //             assert!(v == vec![0]);
+    //         });
+
+    //         g.extend(0..2000);
+
+    //         scoped(|bad_guard| -> Option<()> {
+
+    //             std::mem::swap(good_guard, bad_guard);
+
+    //             None
+    //         });
+
+    //         let x = &*g;
 
     //         Some(())
     //     });
