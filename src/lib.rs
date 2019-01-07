@@ -470,4 +470,27 @@ mod tests {
     //         Some(())
     //     });
     // }
+
+    // #[test]
+    // fn test_cell_swap() {
+    //     use std::cell::Cell;
+
+    //     scoped(|guard| {
+    //         let mut v = guard.on_scope_success(vec![1, 2, 3, 4], |v| {});
+
+    //         let mut c1 = Cell::new(guard);
+
+    //         scoped(|evil_guard| {
+    //             let mut c2 = Cell::new(evil_guard);
+
+    //             c2.swap(&c1);
+
+    //             Some(())
+    //         });
+
+    //         v.push(10);
+
+    //         Some(())
+    //     });
+    // }
 }
