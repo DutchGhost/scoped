@@ -4,71 +4,110 @@
 //! This is different than the ScopeGuard crate does,
 //! because here it's dependent on the scope's outcome which callbacks should run.
 use std::{
-    cell::RefCell,
+    cell::UnsafeCell,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
 };
+
+#[derive(Debug)]
+pub struct Callback<T, F> {
+    item: T,
+    call_fn: F,
+}
+
+impl<T, F> Callback<T, F> {
+    const fn new(item: T, call_fn: F) -> Self {
+        Self { item, call_fn }
+    }
+}
+
+#[derive(Debug)]
+pub enum DeferCallBack<T, F> {
+    Scheduled(Callback<T, F>),
+    Cancelled,
+}
+
+impl<T, F> DeferCallBack<T, F> {
+    fn as_ref(&self) -> Option<&Callback<T, F>> {
+        match self {
+            DeferCallBack::Scheduled(ref callback) => Some(callback),
+            _ => None,
+        }
+    }
+
+    fn as_mut(&mut self) -> Option<&mut Callback<T, F>> {
+        match self {
+            DeferCallBack::Scheduled(ref mut callback) => Some(callback),
+            _ => None,
+        }
+    }
+
+    fn take(&mut self) -> Option<Callback<T, F>> {
+        match std::mem::replace(self, DeferCallBack::Cancelled) {
+            DeferCallBack::Scheduled(callback) => Some(callback),
+            _ => None,
+        }
+    }
+}
 
 trait Defer {
     fn call(self: Box<Self>);
 }
 
-impl<F: FnMut(T), T> Defer for DeferCallback<T, F> {
-    fn call(mut self: Box<Self>) {
-        if let Some(item) = self.item {
-            (self.call_fn)(item);
+impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
+    fn call(self: Box<Self>) {
+        if let DeferCallBack::Scheduled(callback) = *self {
+            (callback.call_fn)(callback.item)
         }
     }
 }
 
-#[derive(Debug)]
-struct DeferCallback<T, F> {
-    item: Option<T>,
-    call_fn: F,
+pub struct DeferStack<'a> {
+    inner: UnsafeCell<Vec<Box<dyn Defer + 'a>>>,
+
+    // NOT SENDABLE,
+    __nosend: PhantomData<*mut ()>,
 }
 
-impl<T, F> DeferCallback<T, F> {
-    const fn new(item: T, call_fn: F) -> Self {
+impl<'a> DeferStack<'a> {
+    #[inline]
+    fn new() -> Self {
         Self {
-            item: Some(item),
-            call_fn,
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct Deferring<'a> {
-    inner: RefCell<Vec<Box<dyn Defer + 'a>>>,
-}
-
-unsafe fn extend_lifetime_mut<'a, 'b, T: ?Sized>(x: &'a mut T) -> &'b mut T {
-    std::mem::transmute(x)
-}
-
-impl<'a> Deferring<'a> {
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: RefCell::new(Vec::new()),
+            inner: UnsafeCell::new(Vec::new()),
+            __nosend: PhantomData,
         }
     }
 
-    fn push<T: 'a>(&self, item: T, closure: impl FnMut(T) + 'a) -> Handle<'a, T> {
-        let mut deferred = Box::new(DeferCallback::new(item, closure));
+    fn push<'s, T: 'a, F: FnOnce(T) + 'a>(&'s self, item: T, closure: F) -> Handle<'s, T, F> {
+        let deferred = Box::new(DeferCallBack::Scheduled(Callback::new(item, closure)));
 
-        // This operation is safe,
-        // We create a mutable reference to the item of the deferred closure,
-        // and extend its lifetime, so it can be returned.
+        // The Box is transformed into a raw pointer,
+        // then the raw pointer *itself* is copied, an transformed into a mutable reference,
+        // and then the original raw pointer is transformed back into a box,
+        // finally the mutable reference is returned in the form of a Handle.
         //
-        // Extending the lifetime is safe here,
-        // because `deferred` is stored on the heap.
-        // Moving the box (as we do with .push()) does not invalidate the mutable reference,
-        // and we never touch the box again without &mut self
-        let ret = unsafe { extend_lifetime_mut(&mut deferred.item) };
-        self.inner.borrow_mut().push(deferred);
-        Handle { inner: ret }
+        // This is safe, because the Handle has lifetime 's, which is the lifetime of Self.
+        // Trying to hold onto a Handle when Self drops, is not possible.
+        //
+        // Also, the Handle is not invalidad whenever the Box moves (on a vectors reallocation for example),
+        // because the mutable reference the Handle contains, references heap memory.
+        unsafe {
+            let raw_ptr = Box::into_raw(deferred);
+
+            let ret: &mut DeferCallBack<T, F> = &mut *raw_ptr;
+            let deferred = Box::from_raw(raw_ptr);
+
+            (&mut *(self.inner.get())).push(deferred);
+
+            Handle {
+                inner: ret,
+                __nosend: PhantomData,
+            }
+        }
     }
 
-    fn execute(mut self) {
-        let v = std::mem::replace(self.inner.get_mut(), vec![]);
+    fn execute(self) {
+        let v = std::mem::replace(&mut self.inner.into_inner(), vec![]);
         for d in v.into_iter().rev() {
             d.call();
         }
@@ -77,91 +116,108 @@ impl<'a> Deferring<'a> {
 
 /// A handle is a handle back to the value a deferred closure is going to be called with.
 /// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
-pub struct Handle<'a, T> {
-    inner: &'a mut Option<T>,
+pub struct Handle<'a, T: 'a, F> {
+    inner: &'a mut DeferCallBack<T, F>,
+
+    // NOT SENDABLE,
+    __nosend: PhantomData<*mut ()>,
 }
 
-impl<'a, T> Handle<'a, T> {
+impl<'a, T, F> Handle<'a, T, F> {
     /// Cancel's the handle's deferred closure,
     /// returning the value the closure was going to be called with.
     #[inline]
     pub fn cancel(self) -> T {
-        self.inner.take().expect("Called cancel on an empty Handle")
+        // drop the function, return the value
+        let Callback { item, .. } = self.inner.take().expect("Called cancel on an empty Handle");
+
+        item
     }
 }
 
-impl<'a, T> Deref for Handle<'a, T> {
+impl<'a, T, F> Deref for Handle<'a, T, F> {
     type Target = T;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        self.inner
+        &self
+            .inner
             .as_ref()
             .expect("Called deref on an empty Handle")
+            .item
     }
 }
 
-impl<'a, T> DerefMut for Handle<'a, T> {
+impl<'a, T, F> DerefMut for Handle<'a, T, F> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner
+        &mut self
+            .inner
             .as_mut()
             .expect("Called deref_mut on an empty Handle")
+            .item
     }
 }
 
 /// A guard is a handle to schedule closures on.
-/// Scheduling a closure takes a closure with 1 parameter,
-/// and the parameter it is going to be called with.
-/// It returns a [`Handle`] to the parameter, so it's still usable within the scope.
-/// A [`Handle`] implements Deref and DerefMut, to access the parameter.
-/// To cancel a callback, [`Handle::cancel`] should be called.
+/// Scheduling a closure takes a closure, and the paremeter to call it with.
+/// The returned value from scheduling is a [`Handle`].
+///
+/// This handle implements Deref and DerefMut,
+/// through which the specified parameter is still accesable within the scope.
 ///
 /// Its important to note that closures scheduled with [`Guard::on_scope_exit`] will *always* run,
 /// and will always run after all closures scheduled to run on success or failure are executed.
 ///
 /// The last scheduled closure gets runned first.
-#[derive(Default)]
 pub struct Guard<'a> {
     /// Callbacks to be run on a scope's success.
-    on_scope_success: Deferring<'a>,
+    on_scope_success: DeferStack<'a>,
 
     /// Callbacks to be run on a scope's failure.
-    on_scope_failure: Deferring<'a>,
+    on_scope_failure: DeferStack<'a>,
 
     /// Callbacks to be run on a scope's exit.
-    on_scope_exit: Deferring<'a>,
+    on_scope_exit: DeferStack<'a>,
 }
 
+// @NOTE: A GUARD SHOULD ONLY BE CREATED BY THE LIBRARY.
+// ANY WAY TO CREATE A GUARD AS A USER OF THIS LIBRARY IS UNSOUND,
+// BECAUSE YOU COULD drop(mem::replace(old_guard, new_guard)),
+// WHICH INVALIDATES ALL HANDLES RETURNED BY `old_guard`.
+//
+// THIS IS WHY THERE IS NO DEFAULT IMPLEMENTATION, OR EVEN A NEW METHOD.
 impl<'a> Guard<'a> {
-    fn new() -> Self {
-        Self {
-            on_scope_success: Deferring::new(),
-            on_scope_failure: Deferring::new(),
-            on_scope_exit: Deferring::new(),
-        }
-    }
-    /// Schedules defered closure `dc` to run on a scope's success.
+    /// Schedules deferred closure `dc` to run on a scope's success.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_success<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_success<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
+        item: T,
+        dc: F,
+    ) -> Handle<'s, T, F> {
         self.on_scope_success.push(item, dc)
     }
 
-    /// Schedules defered closure `dc` to run on a scope's exit.
+    /// Schedules deferred closure `dc` to run on a scope's exit.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_exit<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_exit<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
+        item: T,
+        dc: F,
+    ) -> Handle<'s, T, F> {
         self.on_scope_exit.push(item, dc)
     }
 
-    /// Schedules defered closure `dc` to run on a scope's failure.
+    /// Schedules deferred closure `dc` to run on a scope's failure.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    #[allow(clippy::mut_from_ref)]
-    pub fn on_scope_failure<T: 'a>(&self, item: T, dc: impl FnMut(T) + 'a) -> Handle<T> {
+    pub fn on_scope_failure<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
+        item: T,
+        dc: F,
+    ) -> Handle<'s, T, F> {
         self.on_scope_failure.push(item, dc)
     }
 }
@@ -218,10 +274,44 @@ impl<T> Failure for Option<T> {
 ///     assert_eq!(number.get(), 3);
 /// }
 /// ```
-pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
-    let mut guard = Guard::new();
+///
+/// A callback can also be cancelled, using [`Handle::cancel`]
+/// ```
+/// use scoped::{Guard, scoped};
+///
+/// fn main() {
+///
+///     let mut v = vec![1, 2, 3];
+///
+///     scoped(|guard| -> Option<()> {
+///         let mut handle = guard.on_scope_exit(&mut v, |vec| {
+///             panic!()
+///         });
+///
+///         handle.push(4);
+///         
+///         let cancelled = handle.cancel();
+///
+///         cancelled.push(5);
+///         
+///         Some(())
+///     });
+///
+///     assert_eq!(v, vec![1, 2, 3, 4, 5]);
+/// }
+/// ```
+pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&Guard<'a>) -> R + 'a) -> R {
+    // Notice that only an &Guard<'a> is given,
+    // this way, 2 guard's can never be mem::swap`d,
+    // or mem::replace`d.
 
-    let ret = scope(&mut guard);
+    let guard = Guard {
+        on_scope_success: DeferStack::new(),
+        on_scope_failure: DeferStack::new(),
+        on_scope_exit: DeferStack::new(),
+    };
+
+    let ret = scope(&guard);
 
     if !ret.is_error() {
         guard.on_scope_success.execute();
@@ -234,6 +324,39 @@ pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&mut Guard<'a>) -> R) -> R {
     ret
 }
 
+#[macro_export]
+macro_rules! scope_success {
+    ($guard:expr, $capture:expr, $exec:expr) => {
+        $guard.on_scope_success($capture, $exec)
+    };
+
+    ($guard:expr, $exec:expr) => {
+        $guard.on_scope_success((), |_| $exec())
+    };
+}
+
+#[macro_export]
+macro_rules! scope_failure {
+    ($guard:expr, $capture:expr, $exec:expr) => {
+        $guard.on_scope_failure($capture, $exec)
+    };
+
+    ($guard:expr, $exec:expr) => {
+        $guard.on_scope_failure((), |_| $exec())
+    };
+}
+
+#[macro_export]
+macro_rules! scope_exit {
+    ($guard:expr, $capture:expr, $exec:expr) => {
+        $guard.on_scope_exit($capture, $exec)
+    };
+
+    ($guard:expr, $exec:expr) => {
+        $guard.on_scope_exit((), |_| $exec())
+    };
+}
+
 pub type ScopeResult<E> = Result<(), E>;
 
 #[cfg(test)]
@@ -243,7 +366,7 @@ mod tests {
     #[test]
     fn test_list() {
         let mut v = vec![1, 2, 3, 4, 5];
-        let scope = scoped(|guard| {
+        scoped(|guard| -> Option<()> {
             let mut v = guard.on_scope_success(&mut v, |v| {
                 println!("SUCCES!");
 
@@ -261,7 +384,7 @@ mod tests {
 
             **boxed = 12;
 
-            Some(10)
+            Some(())
         });
     }
 
@@ -312,4 +435,62 @@ mod tests {
 
         assert_eq!(v, Ok(vec![1, 2, 3, 4, 5, 10]));
     }
+
+    // #[test]
+    // fn leak_handle() {
+    //     let mut handles = vec![];
+
+    //     scoped(|guard| {
+    //         let handle = guard.on_scope_exit(vec![1, 2, 3, 4], |v| {});
+
+    //         handles.push(handle);
+
+    //         Some(())
+    //     });
+    // }
+
+    // #[test]
+    // fn test_swap_guards() {
+    //     scoped(|good_guard| {
+    //         let mut g = good_guard.on_scope_success(vec![0], |mut v| {
+    //             assert!(v == vec![0]);
+    //         });
+
+    //         g.extend(0..2000);
+
+    //         scoped(|bad_guard| -> Option<()> {
+
+    //             std::mem::swap(good_guard, bad_guard);
+
+    //             None
+    //         });
+
+    //         let x = &*g;
+
+    //         Some(())
+    //     });
+    // }
+
+    // #[test]
+    // fn test_cell_swap() {
+    //     use std::cell::Cell;
+
+    //     scoped(|guard| {
+    //         let mut v = guard.on_scope_success(vec![1, 2, 3, 4], |v| {});
+
+    //         let mut c1 = Cell::new(guard);
+
+    //         scoped(|evil_guard| {
+    //             let mut c2 = Cell::new(evil_guard);
+
+    //             c2.swap(&c1);
+
+    //             Some(())
+    //         });
+
+    //         v.push(10);
+
+    //         Some(())
+    //     });
+    // }
 }
