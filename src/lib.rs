@@ -65,7 +65,7 @@ impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
 pub struct DeferStack<'a> {
     inner: UnsafeCell<Vec<Box<dyn Defer + 'a>>>,
 
-    // NOT SENDABLE,
+    // NOT SENDABLE, OR SYNCABLE
     __nosend: PhantomData<*mut ()>,
 }
 
@@ -78,7 +78,7 @@ impl<'a> DeferStack<'a> {
         }
     }
 
-    fn push<'s, T: 'a, F: FnOnce(T) + 'a>(&'s self, item: T, closure: F) -> Handle<'s, T, F> {
+    fn push_with<'s, T: 'a, F: FnOnce(T) + 'a>(&'s self, item: T, closure: F) -> Handle<'s, T, F> {
         let deferred = Box::new(DeferCallBack::Scheduled(Callback::new(item, closure)));
 
         // The Box is transformed into a raw pointer,
@@ -106,6 +106,10 @@ impl<'a> DeferStack<'a> {
         }
     }
 
+    fn push<'s, F: FnOnce() + 'a>(&'s self, closure: F) -> Handle<'s, (), impl FnOnce(())> {
+        self.push_with((), |_| closure())
+    }
+
     fn execute(self) {
         let v = std::mem::replace(&mut self.inner.into_inner(), vec![]);
         for d in v.into_iter().rev() {
@@ -114,12 +118,13 @@ impl<'a> DeferStack<'a> {
     }
 }
 
-/// A handle is a handle back to the value a deferred closure is going to be called with.
-/// In order to cancel the closure, and get back the value, use [`Handle::cancel`].
-pub struct Handle<'a, T: 'a, F> {
+/// A handle is a handle back to a deferred closure.
+/// In order to cancel the closure, and get back the value the closure was going to be called with,
+/// use [`Handle::cancel`].
+pub struct Handle<'a, T, F> {
     inner: &'a mut DeferCallBack<T, F>,
 
-    // NOT SENDABLE,
+    // NOT SENDABLE, OR SYNCABLE
     __nosend: PhantomData<*mut ()>,
 }
 
@@ -160,13 +165,27 @@ impl<'a, T, F> DerefMut for Handle<'a, T, F> {
 }
 
 /// A guard is a handle to schedule closures on.
-/// Scheduling a closure takes a closure, and the paremeter to call it with.
-/// The returned value from scheduling is a [`Handle`].
+/// 
+/// A guard can schedule 2 closure types,
+/// closures that take no arguments,
+/// and closures that take 1 argument.
+/// 
+/// Scheduling a closure that takes no arguments, can be done trough the following methods:
+/// - [`Guard::on_scope_success`]
+/// - [`Guard::on_scope_failure`]
+/// - [`Guard::on_scope_exit`]
+/// 
+/// These methods return a [`Handle`], through which cancelling of the scheduled closure is possible.
+/// 
+/// Scheduling a closure that takes 1 argument, can be done trough the following methods:
+/// - [`Guard::on_scope_success_with`]
+/// - [`Guard::on_scope_failure_with`]
+/// - [`Guard::on_scope_exit_with`]
+/// 
+/// These methods also take the argument they are going to be called with, and return a [`Handle`].
+/// The [`Handle`] can be used to cancel the scheduled closure, as well as accessing the given argument trough [`Deref`] and [`DerefMut`]
 ///
-/// This handle implements Deref and DerefMut,
-/// through which the specified parameter is still accesable within the scope.
-///
-/// Its important to note that closures scheduled with [`Guard::on_scope_exit`] will *always* run,
+/// Its important to note that closures scheduled with [`Guard::on_scope_exit`] and [`Guard::on_scope_exit_with`], will *always* run,
 /// and will always run after all closures scheduled to run on success or failure are executed.
 ///
 /// The last scheduled closure gets runned first.
@@ -190,35 +209,59 @@ pub struct Guard<'a> {
 impl<'a> Guard<'a> {
     /// Schedules deferred closure `dc` to run on a scope's success.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
-    /// returning the value the closure was going to be called with.
-    pub fn on_scope_success<'s, T: 'a, F: FnOnce(T) + 'a>(
+    pub fn on_scope_success<'s, F: FnOnce() + 'a>(
         &'s self,
-        item: T,
         dc: F,
-    ) -> Handle<'s, T, F> {
-        self.on_scope_success.push(item, dc)
+    ) -> Handle<'s, (), impl FnOnce(()) + 'a> {
+        self.on_scope_success.push(dc)
+    }
+
+    /// Schedules deferred closure `dc` to run on a scope's exit.
+    /// The deferred closure can be cancelled using [`Handle::cancel`],
+    pub fn on_scope_exit<'s, F: FnOnce() + 'a>(&'s self, dc: F) -> Handle<'s, (), impl FnOnce(())> {
+        self.on_scope_exit.push(dc)
+    }
+
+    /// Schedules deferred closure `dc` to run on a scope's failure.
+    /// The deferred closure can be cancelled using [`Handle::cancel`],
+    pub fn on_scope_failure<'s, F: FnOnce() + 'a>(
+        &'s self,
+        dc: F,
+    ) -> Handle<'s, (), impl FnOnce(())> {
+        self.on_scope_failure.push(dc)
     }
 
     /// Schedules deferred closure `dc` to run on a scope's exit.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    pub fn on_scope_exit<'s, T: 'a, F: FnOnce(T) + 'a>(
+    pub fn on_scope_exit_with<'s, T: 'a, F: FnOnce(T) + 'a>(
         &'s self,
         item: T,
         dc: F,
     ) -> Handle<'s, T, F> {
-        self.on_scope_exit.push(item, dc)
+        self.on_scope_exit.push_with(item, dc)
     }
 
     /// Schedules deferred closure `dc` to run on a scope's failure.
     /// The deferred closure can be cancelled using [`Handle::cancel`],
     /// returning the value the closure was going to be called with.
-    pub fn on_scope_failure<'s, T: 'a, F: FnOnce(T) + 'a>(
+    pub fn on_scope_failure_with<'s, T: 'a, F: FnOnce(T) + 'a>(
         &'s self,
         item: T,
         dc: F,
     ) -> Handle<'s, T, F> {
-        self.on_scope_failure.push(item, dc)
+        self.on_scope_failure.push_with(item, dc)
+    }
+
+    /// Schedules deferred closure `dc` to run on a scope's success.
+    /// The deferred closure can be cancelled using [`Handle::cancel`],
+    /// returning the value the closure was going to be called with.
+    pub fn on_scope_success_with<'s, T: 'a, F: FnOnce(T) + 'a>(
+        &'s self,
+        item: T,
+        dc: F,
+    ) -> Handle<'s, T, F> {
+        self.on_scope_success.push_with(item, dc)
     }
 }
 
@@ -244,8 +287,12 @@ impl<T> Failure for Option<T> {
 
 /// Executes the scope `scope`.
 /// A scope is a closure, in which access to a guard is granted.
-/// A guard is used to schedule callbacks to run on a scope's success, failure, or exit, using
-/// [`Guard::on_scope_success`], [`Guard::on_scope_failure`], [`Guard::on_scope_exit`].
+/// A guard is used to schedule callbacks to run on a scope's success, failure, or exit.
+/// 
+/// For more information on how to use the guard, see [`Guard`].
+/// 
+/// The scope is required to return a type implementing [`Failure`],
+/// to indicate whether the scoped exited with success, or failure.
 ///
 /// # Examples
 /// ```
@@ -254,24 +301,24 @@ impl<T> Failure for Option<T> {
 /// fn main() {
 ///     use std::cell::Cell;
 ///
-///     let mut number = Cell::new(0);
+///     let mut n = Cell::new(0);
 ///
 ///     scoped(|guard| -> Result<(), ()> {
 ///
-///         guard.on_scope_exit(&number, move |n| {
+///         guard.on_scope_exit(|| {
 ///             assert_eq!(n.get(), 2);
 ///             n.set(3);
 ///         });
 ///
-///         guard.on_scope_success(&number, move |n| {
+///         guard.on_scope_success(|| {
 ///             assert_eq!(n.get(), 1);
 ///             n.set(2);
 ///         });
 ///
-///         number.set(1);
+///         n.set(1);
 ///         Ok(())
 ///     });
-///     assert_eq!(number.get(), 3);
+///     assert_eq!(n.get(), 3);
 /// }
 /// ```
 ///
@@ -284,7 +331,7 @@ impl<T> Failure for Option<T> {
 ///     let mut v = vec![1, 2, 3];
 ///
 ///     scoped(|guard| -> Option<()> {
-///         let mut handle = guard.on_scope_exit(&mut v, |vec| {
+///         let mut handle = guard.on_scope_exit_with(&mut v, |vec| {
 ///             panic!()
 ///         });
 ///
@@ -324,39 +371,6 @@ pub fn scoped<'a, R: Failure>(scope: impl FnOnce(&Guard<'a>) -> R + 'a) -> R {
     ret
 }
 
-#[macro_export]
-macro_rules! scope_success {
-    ($guard:expr, $capture:expr, $exec:expr) => {
-        $guard.on_scope_success($capture, $exec)
-    };
-
-    ($guard:expr, $exec:expr) => {
-        $guard.on_scope_success((), |_| $exec())
-    };
-}
-
-#[macro_export]
-macro_rules! scope_failure {
-    ($guard:expr, $capture:expr, $exec:expr) => {
-        $guard.on_scope_failure($capture, $exec)
-    };
-
-    ($guard:expr, $exec:expr) => {
-        $guard.on_scope_failure((), |_| $exec())
-    };
-}
-
-#[macro_export]
-macro_rules! scope_exit {
-    ($guard:expr, $capture:expr, $exec:expr) => {
-        $guard.on_scope_exit($capture, $exec)
-    };
-
-    ($guard:expr, $exec:expr) => {
-        $guard.on_scope_exit((), |_| $exec())
-    };
-}
-
 pub type ScopeResult<E> = Result<(), E>;
 
 #[cfg(test)]
@@ -367,7 +381,7 @@ mod tests {
     fn test_list() {
         let mut v = vec![1, 2, 3, 4, 5];
         scoped(|guard| -> Option<()> {
-            let mut v = guard.on_scope_success(&mut v, |v| {
+            let mut v = guard.on_scope_success_with(&mut v, |v| {
                 println!("SUCCES!");
 
                 assert_eq!(*v, vec![1, 2, 3, 4, 5, 6, 7]);
@@ -375,7 +389,7 @@ mod tests {
                 v.push(10);
             });
 
-            let mut boxed = guard.on_scope_exit(Box::new(1), move |boxed| {
+            let mut boxed = guard.on_scope_exit_with(Box::new(1), move |boxed| {
                 assert_eq!(*boxed, 12);
             });
 
@@ -397,16 +411,16 @@ mod tests {
         let n = scoped(|guard| {
             let n = Some(1);
 
-            guard.on_scope_success(&number, move |b| {
+            guard.on_scope_success_with(&number, move |b| {
                 assert!(2 == b.get());
                 b.set(0);
             });
 
-            guard.on_scope_failure(&number, move |b| {
+            guard.on_scope_failure_with(&number, move |b| {
                 b.set(-1);
             });
 
-            guard.on_scope_exit(&number, move |b| {
+            guard.on_scope_exit_with(&number, move |b| {
                 b.set(0);
             });
 
@@ -424,7 +438,7 @@ mod tests {
         let v = vec![1, 2, 3, 4, 5];
 
         let v = scoped(|guard| -> Result<Vec<_>, ()> {
-            let mut v = guard.on_scope_exit(v, |vec| panic!(vec));
+            let mut v = guard.on_scope_exit_with(v, |vec| panic!(vec));
 
             v.push(10);
 
@@ -441,7 +455,7 @@ mod tests {
     //     let mut handles = vec![];
 
     //     scoped(|guard| {
-    //         let handle = guard.on_scope_exit(vec![1, 2, 3, 4], |v| {});
+    //         let handle = guard.on_scope_exit_with(vec![1, 2, 3, 4], |v| {});
 
     //         handles.push(handle);
 
@@ -452,7 +466,7 @@ mod tests {
     // #[test]
     // fn test_swap_guards() {
     //     scoped(|good_guard| {
-    //         let mut g = good_guard.on_scope_success(vec![0], |mut v| {
+    //         let mut g = good_guard.on_scope_success_with(vec![0], |mut v| {
     //             assert!(v == vec![0]);
     //         });
 
@@ -476,7 +490,7 @@ mod tests {
     //     use std::cell::Cell;
 
     //     scoped(|guard| {
-    //         let mut v = guard.on_scope_success(vec![1, 2, 3, 4], |v| {});
+    //         let mut v = guard.on_scope_success_with(vec![1, 2, 3, 4], |v| {});
 
     //         let mut c1 = Cell::new(guard);
 
