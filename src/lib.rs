@@ -5,12 +5,11 @@
 //! because here it's dependent on the scope's outcome which callbacks should run.
 use std::{
     cell::UnsafeCell,
-    marker::PhantomData,
     ops::{Deref, DerefMut},
 };
 
 #[derive(Debug)]
-pub struct Callback<T, F> {
+struct Callback<T, F> {
     item: T,
     call_fn: F,
 }
@@ -22,7 +21,7 @@ impl<T, F> Callback<T, F> {
 }
 
 #[derive(Debug)]
-pub enum DeferCallBack<T, F> {
+enum DeferCallBack<T, F> {
     Scheduled(Callback<T, F>),
     Cancelled,
 }
@@ -62,11 +61,8 @@ impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
     }
 }
 
-pub struct DeferStack<'a> {
+struct DeferStack<'a> {
     inner: UnsafeCell<Vec<Box<dyn Defer + 'a>>>,
-
-    // NOT SENDABLE, OR SYNCABLE
-    __nosend: PhantomData<*mut ()>,
 }
 
 impl<'a> DeferStack<'a> {
@@ -74,7 +70,6 @@ impl<'a> DeferStack<'a> {
     fn new() -> Self {
         Self {
             inner: UnsafeCell::new(Vec::new()),
-            __nosend: PhantomData,
         }
     }
 
@@ -99,10 +94,7 @@ impl<'a> DeferStack<'a> {
 
             (&mut *(self.inner.get())).push(deferred);
 
-            Handle {
-                inner: ret,
-                __nosend: PhantomData,
-            }
+            Handle { inner: ret }
         }
     }
 
@@ -123,9 +115,6 @@ impl<'a> DeferStack<'a> {
 /// use [`Handle::cancel`].
 pub struct Handle<'a, T, F> {
     inner: &'a mut DeferCallBack<T, F>,
-
-    // NOT SENDABLE, OR SYNCABLE
-    __nosend: PhantomData<*mut ()>,
 }
 
 impl<'a, T, F> Handle<'a, T, F> {
@@ -165,23 +154,23 @@ impl<'a, T, F> DerefMut for Handle<'a, T, F> {
 }
 
 /// A guard is a handle to schedule closures on.
-/// 
+///
 /// A guard can schedule 2 closure types,
 /// closures that take no arguments,
 /// and closures that take 1 argument.
-/// 
+///
 /// Scheduling a closure that takes no arguments, can be done trough the following methods:
 /// - [`Guard::on_scope_success`]
 /// - [`Guard::on_scope_failure`]
 /// - [`Guard::on_scope_exit`]
-/// 
+///
 /// These methods return a [`Handle`], through which cancelling of the scheduled closure is possible.
-/// 
+///
 /// Scheduling a closure that takes 1 argument, can be done trough the following methods:
 /// - [`Guard::on_scope_success_with`]
 /// - [`Guard::on_scope_failure_with`]
 /// - [`Guard::on_scope_exit_with`]
-/// 
+///
 /// These methods also take the argument they are going to be called with, and return a [`Handle`].
 /// The [`Handle`] can be used to cancel the scheduled closure, as well as accessing the given argument trough [`Deref`] and [`DerefMut`]
 ///
@@ -288,9 +277,9 @@ impl<T> Failure for Option<T> {
 /// Executes the scope `scope`.
 /// A scope is a closure, in which access to a guard is granted.
 /// A guard is used to schedule callbacks to run on a scope's success, failure, or exit.
-/// 
+///
 /// For more information on how to use the guard, see [`Guard`].
-/// 
+///
 /// The scope is required to return a type implementing [`Failure`],
 /// to indicate whether the scoped exited with success, or failure.
 ///

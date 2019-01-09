@@ -1,10 +1,10 @@
 [package]
 name = "scoped"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Dodo <kasper199914@gmail.com>"]
 edition = "2018"
 license = "MIT"
-description = "Run deferred closures at success, failure, or exit of a scope"
+description = "Run deferred closures at success, failure, or exit of a scope. Also supports cancelling them"
 repository = "https://github.com/DutchGhost/scoped.git"
-
+keywords = ["scope", "scoped", "guard", "defer"]
 [dependencies]
