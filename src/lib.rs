@@ -62,7 +62,19 @@ impl<F: FnOnce(T), T> Defer for DeferCallBack<T, F> {
 }
 
 struct DeferStack<'a> {
-    inner: UnsafeCell<Vec<Box<dyn Defer + 'a>>>,
+    inner: UnsafeCell<Vec<*mut (dyn Defer + 'a)>>,
+}
+
+impl <'a> Drop for DeferStack<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            let v: &mut Vec<_> = &mut *(self.inner.get());
+
+            for defer in v.drain(..).map(|ptr| Box::from_raw(ptr)) {
+                drop(defer);
+            }
+        }
+    }
 }
 
 impl<'a> DeferStack<'a> {
@@ -90,7 +102,7 @@ impl<'a> DeferStack<'a> {
             let raw_ptr = Box::into_raw(deferred);
 
             let ret: &mut DeferCallBack<T, F> = &mut *raw_ptr;
-            let deferred = Box::from_raw(raw_ptr);
+            let deferred = raw_ptr;
 
             (&mut *(self.inner.get())).push(deferred);
 
@@ -102,10 +114,12 @@ impl<'a> DeferStack<'a> {
         self.push_with((), |_| closure())
     }
 
-    fn execute(self) {
-        let v = std::mem::replace(&mut self.inner.into_inner(), vec![]);
-        for d in v.into_iter().rev() {
-            d.call();
+    fn execute(mut self) {
+        let v = std::mem::replace(&mut self.inner, UnsafeCell::new(vec![]));
+        for defer in v.into_inner().into_iter().rev().map(|ptr| unsafe {
+            Box::from_raw(ptr)
+        }) {    
+            defer.call();
         }
     }
 }
